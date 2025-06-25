@@ -1,0 +1,2 @@
+# Recycla-Smary Contract
+
