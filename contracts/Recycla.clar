@@ -19,6 +19,12 @@
 (define-constant err-cannot-verify-own (err u106))
 (define-constant err-invalid-coordinates (err u107))
 (define-constant err-reward-already-claimed (err u108))
+(define-constant err-center-not-registered (err u109))
+(define-constant err-center-already-registered (err u110))
+(define-constant err-insufficient-capacity (err u111))
+(define-constant err-invalid-waste-type (err u112))
+(define-constant err-collection-not-scheduled (err u113))
+(define-constant err-collection-already-completed (err u114))
 
 (define-constant base-report-reward u100)
 (define-constant base-recycle-reward u200)
@@ -29,6 +35,9 @@
 (define-data-var next-report-id uint u1)
 (define-data-var total-recycled uint u0)
 (define-data-var contract-balance uint u0)
+(define-data-var next-center-id uint u1)
+(define-data-var next-collection-id uint u1)
+(define-data-var total-centers uint u0)
 
 ;; data maps
 (define-map waste-reports
@@ -77,6 +86,50 @@
 (define-map user-balances
   principal
   uint
+)
+
+(define-map collection-centers
+  uint
+  {
+    owner: principal,
+    name: (string-ascii 100),
+    location-lat: int,
+    location-lng: int,
+    waste-types: (list 10 (string-ascii 20)),
+    max-capacity: uint,
+    current-capacity: uint,
+    is-active: bool,
+    registration-timestamp: uint,
+    total-collections: uint,
+    reputation-score: uint,
+    service-fee: uint
+  }
+)
+
+(define-map collection-schedules
+  uint
+  {
+    center-id: uint,
+    report-id: uint,
+    scheduler: principal,
+    scheduled-time: uint,
+    waste-type: (string-ascii 50),
+    estimated-amount: uint,
+    status: (string-ascii 20),
+    completion-timestamp: uint,
+    actual-amount: uint,
+    fee-paid: uint
+  }
+)
+
+(define-map center-ratings
+  { center-id: uint, rater: principal }
+  { rating: uint, timestamp: uint, comment: (string-ascii 200) }
+)
+
+(define-map center-operators
+  uint
+  (list 5 principal)
 )
 
 ;; public functions
@@ -221,6 +274,197 @@
   )
 )
 
+(define-public (register-collection-center (name (string-ascii 100)) (lat int) (lng int) (waste-types (list 10 (string-ascii 20))) (max-capacity uint) (service-fee uint))
+  (let
+    (
+      (center-id (var-get next-center-id))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (and (>= lat -90000000) (<= lat 90000000)) err-invalid-coordinates)
+    (asserts! (and (>= lng -180000000) (<= lng 180000000)) err-invalid-coordinates)
+    (asserts! (> max-capacity u0) err-invalid-amount)
+    (asserts! (> (len waste-types) u0) err-invalid-waste-type)
+    
+    (map-set collection-centers center-id
+      {
+        owner: tx-sender,
+        name: name,
+        location-lat: lat,
+        location-lng: lng,
+        waste-types: waste-types,
+        max-capacity: max-capacity,
+        current-capacity: u0,
+        is-active: true,
+        registration-timestamp: current-time,
+        total-collections: u0,
+        reputation-score: u500,
+        service-fee: service-fee
+      }
+    )
+    
+    (map-set center-operators center-id (list tx-sender))
+    (var-set next-center-id (+ center-id u1))
+    (var-set total-centers (+ (var-get total-centers) u1))
+    (ok center-id)
+  )
+)
+
+(define-public (update-center-capacity (center-id uint) (new-capacity uint))
+  (let
+    (
+      (center (unwrap! (map-get? collection-centers center-id) err-center-not-registered))
+    )
+    (asserts! (is-eq tx-sender (get owner center)) err-owner-only)
+    (asserts! (>= new-capacity (get current-capacity center)) err-insufficient-capacity)
+    
+    (map-set collection-centers center-id
+      (merge center { max-capacity: new-capacity })
+    )
+    (ok true)
+  )
+)
+
+(define-public (add-waste-type-to-center (center-id uint) (waste-type (string-ascii 20)))
+  (let
+    (
+      (center (unwrap! (map-get? collection-centers center-id) err-center-not-registered))
+      (current-types (get waste-types center))
+    )
+    (asserts! (is-eq tx-sender (get owner center)) err-owner-only)
+    (asserts! (< (len current-types) u10) err-insufficient-capacity)
+    
+    (map-set collection-centers center-id
+      (merge center { waste-types: (unwrap! (as-max-len? (append current-types waste-type) u10) err-insufficient-capacity) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (schedule-collection (center-id uint) (report-id uint) (scheduled-time uint) (estimated-amount uint))
+  (let
+    (
+      (center (unwrap! (map-get? collection-centers center-id) err-center-not-registered))
+      (report (unwrap! (map-get? waste-reports report-id) err-not-found))
+      (collection-id (var-get next-collection-id))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (get verified report) err-not-found)
+    (asserts! (not (get recycled report)) err-already-verified)
+    (asserts! (get is-active center) err-center-not-registered)
+    (asserts! (>= (+ (get current-capacity center) estimated-amount) (get max-capacity center)) err-insufficient-capacity)
+    (asserts! (> scheduled-time current-time) err-invalid-amount)
+    
+    (map-set collection-schedules collection-id
+      {
+        center-id: center-id,
+        report-id: report-id,
+        scheduler: tx-sender,
+        scheduled-time: scheduled-time,
+        waste-type: (get waste-type report),
+        estimated-amount: estimated-amount,
+        status: "scheduled",
+        completion-timestamp: u0,
+        actual-amount: u0,
+        fee-paid: u0
+      }
+    )
+    
+    (map-set collection-centers center-id
+      (merge center { current-capacity: (+ (get current-capacity center) estimated-amount) })
+    )
+    
+    (var-set next-collection-id (+ collection-id u1))
+    (ok collection-id)
+  )
+)
+
+(define-public (complete-collection (collection-id uint) (actual-amount uint))
+  (let
+    (
+      (collection (unwrap! (map-get? collection-schedules collection-id) err-collection-not-scheduled))
+      (center (unwrap! (map-get? collection-centers (get center-id collection)) err-center-not-registered))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (is-eq tx-sender (get owner center)) err-owner-only)
+    (asserts! (is-eq (get status collection) "scheduled") err-collection-already-completed)
+    (asserts! (> actual-amount u0) err-invalid-amount)
+    
+    (let
+      (
+        (capacity-difference (- (get estimated-amount collection) actual-amount))
+        (collection-fee (get service-fee center))
+        (scheduler-balance (default-to u0 (map-get? user-balances (get scheduler collection))))
+      )
+      (asserts! (>= scheduler-balance collection-fee) err-insufficient-balance)
+      
+      (map-set collection-schedules collection-id
+        (merge collection {
+          status: "completed",
+          completion-timestamp: current-time,
+          actual-amount: actual-amount,
+          fee-paid: collection-fee
+        })
+      )
+      
+      (map-set collection-centers (get center-id collection)
+        (merge center {
+          current-capacity: (- (get current-capacity center) capacity-difference),
+          total-collections: (+ (get total-collections center) u1),
+          reputation-score: (+ (get reputation-score center) u10)
+        })
+      )
+      
+      (map-set user-balances (get scheduler collection) (- scheduler-balance collection-fee))
+      (map-set user-balances (get owner center) 
+        (+ (default-to u0 (map-get? user-balances (get owner center))) collection-fee)
+      )
+      
+      (try! (confirm-recycling (get report-id collection)))
+      (ok true)
+    )
+  )
+)
+
+(define-public (rate-collection-center (center-id uint) (rating uint) (comment (string-ascii 200)))
+  (let
+    (
+      (center (unwrap! (map-get? collection-centers center-id) err-center-not-registered))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (rating-key { center-id: center-id, rater: tx-sender })
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-amount)
+    (asserts! (not (is-eq tx-sender (get owner center))) err-cannot-verify-own)
+    
+    (map-set center-ratings rating-key
+      { rating: rating, timestamp: current-time, comment: comment }
+    )
+    
+    (let
+      (
+        (reputation-adjustment (if (>= rating u4) u5 (- u0 u5)))
+      )
+      (map-set collection-centers center-id
+        (merge center { reputation-score: (+ (get reputation-score center) reputation-adjustment) })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (toggle-center-status (center-id uint))
+  (let
+    (
+      (center (unwrap! (map-get? collection-centers center-id) err-center-not-registered))
+    )
+    (asserts! (is-eq tx-sender (get owner center)) err-owner-only)
+    
+    (map-set collection-centers center-id
+      (merge center { is-active: (not (get is-active center)) })
+    )
+    (ok (not (get is-active center)))
+  )
+)
+
 ;; read only functions
 (define-read-only (get-report (report-id uint))
   (map-get? waste-reports report-id)
@@ -248,6 +492,57 @@
 
 (define-read-only (get-verification-status (report-id uint) (verifier principal))
   (map-get? report-verifications { report-id: report-id, verifier: verifier })
+)
+
+(define-read-only (get-collection-center (center-id uint))
+  (map-get? collection-centers center-id)
+)
+
+(define-read-only (get-collection-schedule (collection-id uint))
+  (map-get? collection-schedules collection-id)
+)
+
+(define-read-only (get-center-rating (center-id uint) (rater principal))
+  (map-get? center-ratings { center-id: center-id, rater: rater })
+)
+
+(define-read-only (get-center-operators (center-id uint))
+  (map-get? center-operators center-id)
+)
+
+(define-read-only (get-centers-near-location (lat int) (lng int) (radius int))
+  (var-get next-center-id)
+)
+
+(define-read-only (get-available-centers-for-waste-type (waste-type (string-ascii 20)))
+  (var-get next-center-id)
+)
+
+(define-read-only (get-center-performance-stats (center-id uint))
+  (let
+    (
+      (center (unwrap! (map-get? collection-centers center-id) none))
+    )
+    (some {
+      total-collections: (get total-collections center),
+      reputation-score: (get reputation-score center),
+      capacity-utilization: (/ (* (get current-capacity center) u100) (get max-capacity center)),
+      is-active: (get is-active center),
+      service-fee: (get service-fee center)
+    })
+  )
+)
+
+(define-read-only (get-total-centers)
+  (var-get total-centers)
+)
+
+(define-read-only (get-collection-stats)
+  {
+    total-centers: (var-get total-centers),
+    next-center-id: (var-get next-center-id),
+    next-collection-id: (var-get next-collection-id)
+  }
 )
 
 (define-read-only (calculate-report-reward (amount uint))
@@ -314,3 +609,5 @@
     (ok true)
   )
 )
+
+
