@@ -29,6 +29,9 @@
 (define-constant err-invalid-carbon-amount (err u116))
 (define-constant err-goal-already-exists (err u117))
 (define-constant err-goal-not-found (err u118))
+(define-constant err-streak-insurance-insufficient (err u119))
+(define-constant err-streak-insurance-already-active (err u120))
+(define-constant err-no-active-streak (err u121))
 
 (define-constant base-report-reward u100)
 (define-constant base-recycle-reward u200)
@@ -41,6 +44,12 @@
 (define-constant co2-metal-per-kg u3200)
 (define-constant co2-organic-per-kg u300)
 (define-constant carbon-credit-ratio u1000)
+
+;; streak system constants
+(define-constant streak-insurance-cost u50)
+(define-constant streak-insurance-duration u86400) ;; 24 hours in seconds
+(define-constant day-in-seconds u86400)
+(define-constant max-streak-bonus u300) ;; 300% bonus at 30+ days
 
 ;; data vars
 (define-data-var next-report-id uint u1)
@@ -197,6 +206,23 @@
   { joined-timestamp: uint, contribution: uint, claimed-reward: bool }
 )
 
+;; streak system maps
+(define-map user-streaks
+  principal
+  {
+    current-streak: uint,
+    longest-streak: uint,
+    last-activity-day: uint,
+    streak-insurance-expiry: uint,
+    total-streak-bonuses: uint
+  }
+)
+
+(define-map daily-activities
+  { user: principal, day: uint }
+  { reported: bool, recycled: bool, verified: bool }
+)
+
 ;; public functions
 (define-public (initialize-contract (initial-supply uint))
   (begin
@@ -233,6 +259,7 @@
     )
     
     (unwrap! (update-user-profile tx-sender u1 u0 u0) err-owner-only)
+    (unwrap! (update-daily-activity tx-sender "report") err-owner-only)
     (var-set next-report-id (+ report-id u1))
     (ok report-id)
   )
@@ -265,6 +292,7 @@
       )
       
       (try! (reward-user tx-sender verification-reward))
+      (unwrap! (update-daily-activity tx-sender "verify") err-owner-only)
       (ok new-verification-count)
     )
   )
@@ -293,6 +321,7 @@
       
       (unwrap! (update-user-profile tx-sender u0 (get amount report) recycling-reward) err-owner-only)
       (unwrap! (update-user-profile (get reporter report) u0 u0 reporter-reward) err-owner-only)
+      (unwrap! (update-daily-activity tx-sender "recycle") err-owner-only)
       (var-set total-recycled (+ (var-get total-recycled) (get amount report)))
       
       (ok true)
@@ -707,6 +736,41 @@
   )
 )
 
+;; streak system functions
+(define-public (purchase-streak-insurance)
+  (let
+    (
+      (current-balance (default-to u0 (map-get? user-balances tx-sender)))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (current-streak (default-to 
+        { current-streak: u0, longest-streak: u0, last-activity-day: u0, streak-insurance-expiry: u0, total-streak-bonuses: u0 }
+        (map-get? user-streaks tx-sender)
+      ))
+    )
+    (asserts! (>= current-balance streak-insurance-cost) err-insufficient-balance)
+    (asserts! (> (get current-streak current-streak) u0) err-no-active-streak)
+    (asserts! (< current-time (get streak-insurance-expiry current-streak)) err-streak-insurance-already-active)
+    
+    (map-set user-balances tx-sender (- current-balance streak-insurance-cost))
+    (map-set user-streaks tx-sender
+      (merge current-streak { streak-insurance-expiry: (+ current-time streak-insurance-duration) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (get-streak-bonus (user principal))
+  (let
+    (
+      (streak-data (default-to 
+        { current-streak: u0, longest-streak: u0, last-activity-day: u0, streak-insurance-expiry: u0, total-streak-bonuses: u0 }
+        (map-get? user-streaks user)
+      ))
+    )
+    (ok (calculate-streak-bonus (get current-streak streak-data)))
+  )
+)
+
 ;; read only functions
 (define-read-only (get-report (report-id uint))
   (map-get? waste-reports report-id)
@@ -841,6 +905,48 @@
   }
 )
 
+(define-read-only (get-user-streak (user principal))
+  (map-get? user-streaks user)
+)
+
+(define-read-only (get-streak-leaderboard)
+  (let
+    (
+      ;; This is a simplified version - in a real implementation you'd iterate through users
+      (contract-owner-streak-data (default-to 
+        { current-streak: u0, longest-streak: u0, last-activity-day: u0, streak-insurance-expiry: u0, total-streak-bonuses: u0 }
+        (map-get? user-streaks contract-owner)
+      ))
+      (sample-user-1 (get current-streak contract-owner-streak-data))
+    )
+    { note: "streak-leaderboard-placeholder", top-streak: sample-user-1 }
+  )
+)
+
+(define-read-only (calculate-streak-bonus (streak-days uint))
+  (if (>= streak-days u30)
+    max-streak-bonus
+    (if (>= streak-days u21)
+      u250
+      (if (>= streak-days u14)
+        u200
+        (if (>= streak-days u7)
+          u150
+          (if (>= streak-days u3)
+            u125
+            u100
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-days-since-epoch (timestamp uint))
+  ;; Convert timestamp to days since epoch for streak tracking
+  (/ timestamp day-in-seconds)
+)
+
 (define-read-only (calculate-co2-savings (waste-type (string-ascii 50)) (amount uint))
   (if (is-eq waste-type "plastic")
     (* amount co2-plastic-per-kg)
@@ -865,13 +971,24 @@
   (let
     (
       (current-balance (default-to u0 (map-get? user-balances user)))
-      (multiplier (get-reputation-multiplier user))
-      (final-amount (/ (* amount multiplier) u100))
+      (reputation-multiplier (get-reputation-multiplier user))
+      (streak-bonus (unwrap-panic (get-streak-bonus user)))
+      (combined-multiplier (/ (* reputation-multiplier streak-bonus) u100))
+      (final-amount (/ (* amount combined-multiplier) u100))
+      (streak-data (default-to 
+        { current-streak: u0, longest-streak: u0, last-activity-day: u0, streak-insurance-expiry: u0, total-streak-bonuses: u0 }
+        (map-get? user-streaks user)
+      ))
     )
     (asserts! (<= final-amount (var-get contract-balance)) err-insufficient-balance)
     
     (map-set user-balances user (+ current-balance final-amount))
     (var-set contract-balance (- (var-get contract-balance) final-amount))
+    
+    ;; Update streak bonus tracking
+    (map-set user-streaks user
+      (merge streak-data { total-streak-bonuses: (+ (get total-streak-bonuses streak-data) (- final-amount amount)) })
+    )
     (ok final-amount)
   )
 )
@@ -942,5 +1059,78 @@
   )
 )
 
+(define-private (update-daily-activity (user principal) (activity-type (string-ascii 10)))
+  (let
+    (
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (current-day (get-days-since-epoch current-time))
+      (activity-key { user: user, day: current-day })
+      (current-activity (default-to { reported: false, recycled: false, verified: false } (map-get? daily-activities activity-key)))
+      (current-streak-data (default-to 
+        { current-streak: u0, longest-streak: u0, last-activity-day: u0, streak-insurance-expiry: u0, total-streak-bonuses: u0 }
+        (map-get? user-streaks user)
+      ))
+    )
+    ;; Update daily activity
+    (map-set daily-activities activity-key
+      (if (is-eq activity-type "report")
+        (merge current-activity { reported: true })
+        (if (is-eq activity-type "recycle")
+          (merge current-activity { recycled: true })
+          (if (is-eq activity-type "verify")
+            (merge current-activity { verified: true })
+            current-activity
+          )
+        )
+      )
+    )
+    
+    ;; Update streak if this is the first activity today
+    (if (and (not (get reported current-activity)) (not (get recycled current-activity)) (not (get verified current-activity)))
+      (let
+        (
+          (last-activity-day (get last-activity-day current-streak-data))
+          (is-consecutive (is-eq current-day (+ last-activity-day u1)))
+          (is-same-day (is-eq current-day last-activity-day))
+          (is-insurance-active (> (get streak-insurance-expiry current-streak-data) current-time))
+          (days-gap (- current-day last-activity-day))
+        )
+        (if is-same-day
+          ;; Same day activity, no streak change
+          (ok true)
+          (if (or is-consecutive (and (is-eq days-gap u2) is-insurance-active))
+            ;; Continue or preserve streak
+            (let
+              (
+                (new-streak (+ (get current-streak current-streak-data) u1))
+                (new-longest (if (> new-streak (get longest-streak current-streak-data)) new-streak (get longest-streak current-streak-data)))
+              )
+              (map-set user-streaks user
+                (merge current-streak-data {
+                  current-streak: new-streak,
+                  longest-streak: new-longest,
+                  last-activity-day: current-day,
+                  streak-insurance-expiry: (if (and (is-eq days-gap u2) is-insurance-active) u0 (get streak-insurance-expiry current-streak-data))
+                })
+              )
+              (ok true)
+            )
+            ;; Reset streak
+            (begin
+              (map-set user-streaks user
+                (merge current-streak-data {
+                  current-streak: u1,
+                  last-activity-day: current-day
+                })
+              )
+              (ok true)
+            )
+          )
+        )
+      )
+      (ok true)
+    )
+  )
+)
 
 
